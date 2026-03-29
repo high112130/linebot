@@ -40,23 +40,38 @@ app = Flask(__name__)
 # ===== 工時資料格式 =====
 # Sheet 欄位: 日期, 狀態, 地點, 工時, 加班, 加班費, 出差費, 收入
 
+import re
+
 def parse_message(text):
     text = text.strip()
-    if text.startswith("請假"):
-        return {"status":"請假"}
+
+    # 支援請假
+    if "請假" in text:
+        return {"status": "請假"}
+
     try:
-        parts = text.split()
-        location = parts[0]
+        # 統一符號
+        text = text.replace("～", "~").replace("-", "~")
 
-        text = text.replace("～", "~").replace("-", "~")  # ⭐關鍵
-        time_range = time_str.split("~")
+        # 用正則抓：地點 + 時間
+        match = re.search(r"(\D+)\s*(\d{3,4})~(\d{3,4})", text)
 
-        start = float(time_range[0]) / 100
-        end = float(time_range[1]) / 100
+        if not match:
+            return {"status": "錯誤"}
 
-        return {"status":"上班", "location":location, "start":start, "end":end}
+        location = match.group(1).strip()
+        start = float(match.group(2)) / 100
+        end = float(match.group(3)) / 100
+
+        return {
+            "status": "上班",
+            "location": location,
+            "start": start,
+            "end": end
+        }
+
     except Exception:
-        return {"status":"錯誤"}
+        return {"status": "錯誤"}
 
 def calculate_work(data):
     """計算工時、加班、出差費、今日收入"""
