@@ -1,196 +1,161 @@
-from flask import Flask, request
-import requests, re, datetime, json, os
+# app.py
+import os
+import json
+from datetime import datetime
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import csv
-from io import StringIO
 
+# ===== LINE Bot 設定 =====
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# ===== Google Sheet 設定 =====
+SHEET_ID = os.environ.get("SHEET_ID")
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
+creds_json = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(SHEET_ID).sheet1
+
+# ===== Bot 記錄設定 =====
+BASE_SALARY = 28000
+NEWBIE_ALLOWANCE = 12000
+FULL_ATTENDANCE_BONUS = 2000
+RENT_ALLOWANCE = 3000
+OVERTIME_RATE = 100  # 每小時加班費基準
+TRAVEL_FEES = {"台中":200, "高雄":500, "台南":400}
+
+# ===== Flask App =====
 app = Flask(__name__)
 
-CHANNEL_ACCESS_TOKEN = "SJ5NhauPKZwH3qXGpVGFEOkwBH7TKF5AG5M3OaGzKN2KCUGJ8snWPXHY/VuqheDKRh2gKxSFH357SBrri50RfjcRYX03pEEXFqtkD3hgW+zzUZ1M4zBf0A+f8olVLTaxamDyzvVjk9jXSua4auZhPQdB04t89/1O/w1cDnyilFU="
+# ===== 工時資料格式 =====
+# Sheet 欄位: 日期, 狀態, 地點, 工時, 加班, 加班費, 出差費, 收入
 
-# ===== 固定薪資 =====
-BASE_SALARY = 28000
-NEW_EMP_BONUS = 12000
-FULL_ATTENDANCE = 2000
-RENT_ALLOWANCE = 3000
+def parse_message(text):
+    """
+    範例訊息：
+    '台南 800~2000' -> 地點, 上班時間, 下班時間
+    '請假' -> 狀態請假
+    """
+    text = text.strip()
+    if text.startswith("請假"):
+        return {"status":"請假"}
+    try:
+        parts = text.split()
+        location = parts[0]
+        time_range = parts[1].split("~")
+        start = float(time_range[0])/100
+        end = float(time_range[1])/100
+        return {"status":"上班", "location":location, "start":start, "end":end}
+    except Exception:
+        return {"status":"錯誤"}
 
-HOURLY = (BASE_SALARY + FULL_ATTENDANCE) / 30 / 8
+def calculate_work(data):
+    """計算工時、加班、出差費、今日收入"""
+    if data["status"] == "請假":
+        return {
+            "work_hours":0, "overtime":0, "overtime_pay":0,
+            "travel_fee":0, "income": -BASE_SALARY/22  # 假設月薪平均每日
+        }
 
-travel_fee_map = {"台中":200,"台南":400,"高雄":500}
+    start = data["start"]
+    end = data["end"]
+    work_hours = end - start - 1  # 扣掉午休1小時
+    work_hours = max(work_hours, 0)
+    weekday = datetime.now().weekday()  # 0=Monday
+    overtime = max(work_hours - 8, 0)
+    overtime_pay = 0
 
-DATA_FILE = "monthly_data.json"
-
-# ===== 資料讀寫 =====
-def load_data():
-    if os.path.exists(DATA_FILE):
-        return json.load(open(DATA_FILE, "r", encoding="utf-8"))
-    return {}
-
-def save_data(data):
-    json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
-# ===== LINE 回覆 =====
-def reply(reply_token, text):
-    requests.post(
-        "https://api.line.me/v2/bot/message/reply",
-        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
-        json={"replyToken": reply_token, "messages":[{"type":"text","text":text}]}
-    )
-
-# ===== 時間解析 =====
-def parse_time(text):
-    match = re.search(r'(\d{3,4})[~～-](\d{3,4})', text)
-    if not match:
-        return None
-    s,e = match.groups()
-
-    def t(x):
-        return (int(x[0]), int(x[1:])) if len(x)==3 else (int(x[:2]), int(x[2:]))
-
-    sh,sm = t(s)
-    eh,em = t(e)
-
-    work = (eh+em/60)-(sh+sm/60)-1
-
-    if work <= 0 or work > 24:
-        return None
-
-    ot = max(0, work-8)
-    return work, ot
-
-# ===== 加班費 =====
-def calc_ot(work, ot, weekday):
+    # 週六雙倍薪水
     if weekday == 5:
-        return work * HOURLY * 2
-    return min(2,ot)*HOURLY*1.34 + max(0,ot-2)*HOURLY*1.67
+        base_pay = BASE_SALARY/22*2
+        overtime_pay = overtime*OVERTIME_RATE*2
+    else:
+        base_pay = BASE_SALARY/22
+        overtime_pay = overtime*OVERTIME_RATE
 
-# ===== CSV =====
-def gen_csv(records):
-    out = StringIO()
-    w = csv.writer(out)
-    w.writerow(["日期","狀態","地點","工時","加班","加班費","出差費","收入"])
-    total=0
-    for r in records:
-        w.writerow([r['date'],r['status'],r.get('location',''),r.get('work',0),
-                    r.get('ot',0),int(r.get('ot_pay',0)),r.get('travel',0),int(r.get('income',0))])
-        total+=r.get('income',0)
-    w.writerow(["合計","","","","","", "", int(total)])
-    return out.getvalue(), total
+    travel_fee = TRAVEL_FEES.get(data["location"],0)
+    income = base_pay + overtime_pay + travel_fee
 
-# ===== 核心 =====
+    return {
+        "work_hours":round(work_hours,1),
+        "overtime":round(overtime,1),
+        "overtime_pay":round(overtime_pay,0),
+        "travel_fee":travel_fee,
+        "income":round(income,0)
+    }
+
+def append_to_sheet(date_str, data, calc):
+    """將資料寫入 Google Sheet"""
+    sheet.append_row([
+        date_str,
+        data.get("status",""),
+        data.get("location",""),
+        calc.get("work_hours",0),
+        calc.get("overtime",0),
+        calc.get("overtime_pay",0),
+        calc.get("travel_fee",0),
+        calc.get("income",0)
+    ])
+
+def generate_monthly_csv():
+    """產生本月 CSV"""
+    records = sheet.get_all_records()
+    now = datetime.now()
+    month_str = now.strftime("%Y-%m")
+    filename = f"{month_str}_salary.csv"
+    with open(filename,"w",newline="",encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["日期","狀態","地點","工時","加班","加班費","出差費","收入"])
+        for row in records:
+            if row["日期"].startswith(month_str):
+                writer.writerow([row[k] for k in ["日期","狀態","地點","工時","加班","加班費","出差費","收入"]])
+    return filename
+
+# ===== Flask 路由 =====
 @app.route("/callback", methods=['POST'])
 def callback():
-    data = request.json
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+
     try:
-        event = data['events'][0]
-        text = event['message']['text']
-        token = event['replyToken']
-    except:
-        return "OK"
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK'
 
-    today = datetime.datetime.now()
-    key = today.strftime("%Y-%m")
-    date = today.strftime("%Y-%m-%d")
-    weekday = today.weekday()
+# ===== LINE 訊息處理 =====
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    text = event.message.text
+    data = parse_message(text)
+    if data["status"] == "錯誤":
+        reply = "訊息格式錯誤，請輸入：地點 800~2000 或 請假"
+    else:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        calc = calculate_work(data)
+        append_to_sheet(date_str, data, calc)
+        reply = (f"📍 {data.get('location','')} \n"
+                 f"工時：{calc['work_hours']} 小時\n"
+                 f"加班：{calc['overtime']} 小時\n"
+                 f"加班費：{calc['overtime_pay']} 元\n"
+                 f"出差費：{calc['travel_fee']} 元\n"
+                 f"今日收入：{calc['income']} 元")
 
-    db = load_data()
-    if key not in db:
-        db[key] = {"records":[]}
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply)
+    )
 
-    records = db[key]["records"]
-
-    # ===== 查詢 =====
-    if "本月" in text:
-        if not records:
-            reply(token,"本月無資料")
-            return "OK"
-
-        csv_text,total = gen_csv(records)
-
-        # 全勤判斷
-        has_leave = any(r['status']=="請假" for r in records)
-        full_att = 0 if has_leave else FULL_ATTENDANCE
-
-        final = BASE_SALARY + NEW_EMP_BONUS + RENT_ALLOWANCE + full_att + total
-
-        reply(token,f"📅 {key}\n{csv_text}\n總收入:{int(final)}")
-        return "OK"
-
-    # ===== 查月份 =====
-    m = re.match(r"查月份 (\d{4}-\d{2})", text)
-    if m:
-        k = m.group(1)
-        if k not in db:
-            reply(token,"無資料")
-            return "OK"
-        csv_text,total = gen_csv(db[k]["records"])
-        reply(token,f"{k}\n{csv_text}")
-        return "OK"
-
-    # ===== 請假 =====
-    if "請假" in text or "休假" in text:
-        # 覆蓋當天
-        records = [r for r in records if r['date'] != date]
-
-        status = "請假"
-        if "半天" in text:
-            income = -BASE_SALARY/30/2
-        else:
-            income = -BASE_SALARY/30
-
-        records.append({
-            "date":date,
-            "status":status,
-            "income":income
-        })
-
-        db[key]["records"]=records
-        save_data(db)
-
-        reply(token,"已記錄請假")
-        return "OK"
-
-    # ===== 工作 =====
-    loc = next((l for l in travel_fee_map if l in text), None)
-    if not loc:
-        reply(token,"❌ 請輸入地點（台中/台南/高雄）")
-        return "OK"
-
-    parsed = parse_time(text)
-    if not parsed:
-        reply(token,"❌ 時間錯誤，例如：台南 800~2000")
-        return "OK"
-
-    work, ot = parsed
-    ot_pay = calc_ot(work, ot, weekday)
-    travel = travel_fee_map[loc]
-    income = ot_pay + travel
-
-    # 覆蓋同一天
-    records = [r for r in records if r['date'] != date]
-
-    records.append({
-        "date":date,
-        "status":"上班",
-        "location":loc,
-        "work":work,
-        "ot":ot,
-        "ot_pay":ot_pay,
-        "travel":travel,
-        "income":income
-    })
-
-    db[key]["records"]=records
-    save_data(db)
-
-    reply(token,f"""📍{loc}
-工時:{work:.1f}
-加班:{ot:.1f}
-加班費:{int(ot_pay)}
-出差:{travel}
-收入:{int(income)}""")
-
-    return "OK"
-
-@app.route("/")
-def home():
-    return "OK"
+# ===== 啟動 Flask =====
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
