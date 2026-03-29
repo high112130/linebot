@@ -1,3 +1,6 @@
-flask
+Flask
 requests
 gunicorn
+line-bot-sdk
+gspread
+oauth2client
