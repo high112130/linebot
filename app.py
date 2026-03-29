@@ -1,5 +1,7 @@
 from flask import Flask, request
 import requests, re, datetime, json, os
+import csv
+from io import StringIO
 
 app = Flask(__name__)
 
@@ -71,17 +73,23 @@ def calc_ot_pay(work_hours, overtime, weekday):
     rest = max(0, overtime-2)
     return first2*HOURLY*1.34 + rest*HOURLY*1.67
 
-# ===== 生成表格文字 =====
-def generate_table(records):
-    lines = ["日期\t星期\t地點\t工時\t加班\t加班費\t出差費\t今日收入"]
+# ===== 生成 CSV =====
+def generate_csv(records):
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["日期","星期","地點","工時","加班","加班費","出差費","今日收入"])
     total_ot = total_travel = total_income = 0
     for r in records:
-        lines.append(f"{r['date']}\t{r['weekday']}\t{r['location']}\t{r['work_hours']:.1f}\t{r['overtime']:.1f}\t{int(r['ot_pay'])}\t{r['travel_fee']}\t{int(r['today_income'])}")
+        writer.writerow([
+            r['date'], r['weekday'], r['location'],
+            r['work_hours'], r['overtime'],
+            int(r['ot_pay']), r['travel_fee'], int(r['today_income'])
+        ])
         total_ot += r['ot_pay']
         total_travel += r['travel_fee']
         total_income += r['today_income']
-    lines.append(f"合計\t\t\t\t\t{int(total_ot)}\t{int(total_travel)}\t{int(total_income)}")
-    return "\n".join(lines), total_income
+    writer.writerow(["合計","","","","", int(total_ot), int(total_travel), int(total_income)])
+    return output.getvalue()
 
 # ===== Flask Webhook =====
 @app.route("/callback", methods=['POST'])
@@ -102,14 +110,15 @@ def callback():
         all_data[month_key] = {"records":[]}
 
     # ===== 查本月表格 =====
-    if text in ["本月加班表格", "查本月"]:
+    if text in ["本月表格", "查本月"]:
         records = all_data[month_key]["records"]
         if not records:
-            reply_message(reply_token, "本月尚無加班紀錄")
+            reply_message(reply_token, "本月尚無紀錄")
             return "OK"
-        table, month_total = generate_table(records)
-        full_income = BASE_SALARY + NEW_EMP_BONUS + FULL_ATTENDANCE + RENT_ALLOWANCE + month_total
-        reply = f"📅 {month_key} 月加班表\n{table}\n本月累計收入（含底薪+補助）：{int(full_income)}"
+        csv_text = generate_csv(records)
+        full_month_total = sum(r['today_income'] for r in records)
+        full_income = BASE_SALARY + NEW_EMP_BONUS + FULL_ATTENDANCE + RENT_ALLOWANCE + full_month_total
+        reply = f"📅 {month_key} 月加班表（CSV 格式）\n{csv_text}\n本月累計收入（含底薪+補助）：{int(full_income)}"
         reply_message(reply_token, reply)
         return "OK"
 
@@ -120,9 +129,10 @@ def callback():
         if key not in all_data or not all_data[key]["records"]:
             reply_message(reply_token, f"{key} 尚無加班紀錄")
             return "OK"
-        table, month_total = generate_table(all_data[key]["records"])
-        full_income = BASE_SALARY + NEW_EMP_BONUS + FULL_ATTENDANCE + RENT_ALLOWANCE + month_total
-        reply = f"📅 {key} 月加班表\n{table}\n累計收入（含底薪+補助）：{int(full_income)}"
+        csv_text = generate_csv(all_data[key]["records"])
+        full_month_total = sum(r['today_income'] for r in all_data[key]["records"])
+        full_income = BASE_SALARY + NEW_EMP_BONUS + FULL_ATTENDANCE + RENT_ALLOWANCE + full_month_total
+        reply = f"📅 {key} 月加班表（CSV 格式）\n{csv_text}\n累計收入（含底薪+補助）：{int(full_income)}"
         reply_message(reply_token, reply)
         return "OK"
 
@@ -163,7 +173,6 @@ def callback():
     reply_message(reply_token, reply)
     return "OK"
 
-# ===== 首頁避免 404 =====
 @app.route("/")
 def home():
     return "Bot is running"
