@@ -46,25 +46,38 @@ creds_json = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
 
-_sheet_cache = None
+_user_name_cache = {}
 
-def get_sheet():
-    global _sheet_cache
-    if _sheet_cache is None:
-        sheet_name = now_taipei().strftime("%Y-%m")
-        try:
-            _sheet_cache = client.open_by_key(SHEET_ID).worksheet(sheet_name)
-        except gspread.WorksheetNotFound:
-            _sheet_cache = client.open_by_key(SHEET_ID).add_worksheet(
-                title=sheet_name, rows=1000, cols=10
-            )
-            _sheet_cache.append_row(["user_id","日期","狀態","地點","工時","加班","加班費","出差費","收入"])
-    return _sheet_cache
+def get_line_user_name(user_id):
+    """取得 LINE 用戶顯示名稱，並快取"""
+    if user_id in _user_name_cache:
+        return _user_name_cache[user_id]
+    try:
+        profile = line_bot_api.get_profile(user_id)
+        name = profile.display_name
+        _user_name_cache[user_id] = name
+        return name
+    except Exception:
+        return user_id
+
+def get_user_worksheet(user_id, user_name=None):
+    """取得該用戶的 Google Sheet 工作表，若不存在則建立"""
+    if user_name is None:
+        user_name = get_line_user_name(user_id)
+    sheet_title = f"{user_name} ({user_id})"[:100]
+    try:
+        worksheet = client.open_by_key(SHEET_ID).worksheet(sheet_title)
+    except gspread.WorksheetNotFound:
+        worksheet = client.open_by_key(SHEET_ID).add_worksheet(
+            title=sheet_title, rows=1000, cols=9
+        )
+        worksheet.append_row(["日期","狀態","地點","工時","加班","加班費","出差費","收入","用戶名稱"])
+    return worksheet
 
 # ===== 薪資設定 =====
-MONTHLY_SALARY = 45000          # 固定月薪
-OVERTIME_HOURLY_RATE = 187.5    # 每小時加班費基數
-FULL_ATTENDANCE_BONUS = 2000    # 全勤獎金
+BASE_SALARY = 43000                # 底薪（不含全勤）
+FULL_ATTENDANCE_BONUS = 2000       # 全勤獎金
+OVERTIME_HOURLY_RATE = 187.5       # 加班費基數（每小時）
 
 TRAVEL_FEES = {
     "台中": 200,
@@ -74,18 +87,16 @@ TRAVEL_FEES = {
 
 # ===== 輔助函數 =====
 def get_days_in_month(year, month):
-    """取得當月總天數"""
     return calendar.monthrange(year, month)[1]
 
 def get_daily_wage(date):
-    """計算指定日期所屬月份的日薪 (月薪 ÷ 當月總天數)"""
+    """以底薪計算日薪 (底薪 ÷ 當月總天數)"""
     year = date.year
     month = date.month
     days = get_days_in_month(year, month)
-    return MONTHLY_SALARY / days
+    return BASE_SALARY / days
 
 def parse_time_str(t):
-    """將四位數字字串轉為小時數，例如 '830' -> 8.5"""
     t = t.strip()
     if len(t) == 3:
         t = "0" + t
@@ -94,7 +105,6 @@ def parse_time_str(t):
     return hour + minute / 60.0
 
 def normalize_location(loc):
-    """地點正規化"""
     loc = loc.replace("市", "").replace(" ", "").replace("臺", "台")
     if loc in TRAVEL_FEES:
         return loc
@@ -121,13 +131,8 @@ def parse_message(text):
     except:
         return {"status": "錯誤"}
 
-# ===== 計算薪資（日薪制 + 固定加班費率）=====
+# ===== 計算當日收入 =====
 def calculate_work(data, date):
-    """
-    計算當日收入
-    - 正常工時工資：按實際工時比例給日薪（週六加倍）
-    - 加班費：每小時 187.5 元，前2小時1.34倍，其後1.67倍（週六再乘2）
-    """
     if data["status"] == "請假":
         return {
             "work_hours": 0,
@@ -137,14 +142,12 @@ def calculate_work(data, date):
             "income": 0
         }
 
-    # 取得當日基本日薪（未乘倍率）
     daily_wage = get_daily_wage(date)
-    hourly_wage = daily_wage / 8.0   # 時薪（用於比例計算）
+    hourly_wage = daily_wage / 8.0
 
     start = data["start"]
     end = data["end"]
 
-    # 計算實際工時，扣除午休（若跨過12:00~13:00）
     work_hours = end - start
     if start < 13.0 and end > 12.0:
         work_hours -= 1.0
@@ -153,10 +156,8 @@ def calculate_work(data, date):
     overtime = max(work_hours - 8, 0)
     normal_hours = min(work_hours, 8)
 
-    # 正常工時工資（按比例給日薪）
     normal_pay = (normal_hours / 8.0) * daily_wage
 
-    # 加班費（以固定187.5為基數）
     overtime_pay = 0
     if overtime > 0:
         first2 = min(overtime, 2)
@@ -164,8 +165,7 @@ def calculate_work(data, date):
         if overtime > 2:
             overtime_pay += (overtime - 2) * OVERTIME_HOURLY_RATE * 1.67
 
-    # 星期六（weekday=5）加成
-    if date.weekday() == 5:
+    if date.weekday() == 5:  # 星期六
         normal_pay *= 2
         overtime_pay *= 2
 
@@ -180,49 +180,37 @@ def calculate_work(data, date):
         "income": round(income, 0)
     }
 
-# ===== 寫入/更新 Sheet =====
-def append_or_update_sheet(user_id, date_str, data, calc):
-    sheet = get_sheet()
-    records = sheet.get_all_records()
+# ===== 寫入/更新工作表 =====
+def append_or_update_sheet(user_id, user_name, date_str, data, calc):
+    worksheet = get_user_worksheet(user_id, user_name)
+    records = worksheet.get_all_records()
     target_row = None
     for idx, rec in enumerate(records, start=2):
-        if rec.get("user_id") == user_id and rec.get("日期") == date_str:
+        if rec.get("日期") == date_str:
             target_row = idx
             break
 
     row_data = [
-        user_id, date_str, data.get("status", ""), data.get("location", ""),
-        calc.get("work_hours", 0), calc.get("overtime", 0),
-        calc.get("overtime_pay", 0), calc.get("travel_fee", 0),
-        calc.get("income", 0)
+        date_str,
+        data.get("status", ""),
+        data.get("location", ""),
+        calc.get("work_hours", 0),
+        calc.get("overtime", 0),
+        calc.get("overtime_pay", 0),
+        calc.get("travel_fee", 0),
+        calc.get("income", 0),
+        user_name
     ]
 
     if target_row:
-        sheet.update(f"A{target_row}:I{target_row}", [row_data])
+        worksheet.update(f"A{target_row}:I{target_row}", [row_data])
     else:
-        sheet.append_row(row_data)
+        worksheet.append_row(row_data)
 
-# ===== 計算當月應工作日（週一至週五）=====
-def get_workdays_in_month(year, month):
-    first_day = datetime(year, month, 1, tzinfo=TAIPEI_TZ)
-    if month == 12:
-        last_day = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ) - timedelta(days=1)
-    else:
-        last_day = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ) - timedelta(days=1)
-    workdays = 0
-    current = first_day
-    while current <= last_day:
-        if current.weekday() < 5:  # 週一~週五
-            workdays += 1
-        current += timedelta(days=1)
-    return workdays
-
-# ===== 月報表 =====
-def generate_monthly_report(user_id):
-    sheet = get_sheet()
-    records = sheet.get_all_records()
-    records = [r for r in records if r["user_id"] == user_id]
-    record_map = {r["日期"]: r for r in records}
+# ===== 月報表（精簡版）=====
+def generate_monthly_report(user_id, user_name):
+    worksheet = get_user_worksheet(user_id, user_name)
+    records = worksheet.get_all_records()
 
     now = now_taipei()
     year = now.year
@@ -234,14 +222,20 @@ def generate_monthly_report(user_id):
         end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
 
     total_income = 0
-    result = []
-    worked_days = 0      # 實際有上班的天數（非請假且有打卡）
-    has_leave = False    # 是否有任何請假記錄
+    total_overtime_hours = 0
+    total_overtime_pay = 0
+    total_travel_fee = 0
+    leave_days = 0
+    worked_days = 0
+    auto_paid_days = 0
+    has_leave = False
+
+    record_map = {r["日期"]: r for r in records if r.get("日期")}
 
     current = start_date
     while current < end_date:
         date_str = current.strftime("%Y-%m-%d")
-        daily_wage = get_daily_wage(current)   # 該日基本日薪
+        daily_wage = get_daily_wage(current)
 
         if date_str in record_map:
             row = record_map[date_str]
@@ -249,30 +243,42 @@ def generate_monthly_report(user_id):
             status = row["狀態"]
             if status == "請假":
                 has_leave = True
-                result.append(f"{date_str}：請假 (扣薪)")
-                # 請假不計收入，但已有記錄中收入為0
+                leave_days += 1
             else:
                 worked_days += 1
-                result.append(f"{date_str}：{int(income)} 元")
-            total_income += income
+                total_income += income
+                total_overtime_hours += float(row.get("加班", 0))
+                total_overtime_pay += float(row.get("加班費", 0))
+                total_travel_fee += float(row.get("出差費", 0))
         else:
-            # 未打卡日：僅週一至週五自動給日薪（視為正常出勤），週六日不給
-            if current.weekday() < 5:   # 週一~週五
-                total_income += daily_wage
-                result.append(f"{date_str}：{int(daily_wage)} 元 (自動給薪)")
-            else:
-                result.append(f"{date_str}：未打卡 (週末不計薪)")
+            total_income += daily_wage
+            auto_paid_days += 1
 
         current += timedelta(days=1)
 
-    # 全勤獎金：無請假記錄 且 實際上班天數 >= 當月應工作日數
-    total_workdays = get_workdays_in_month(year, month)
-    if not has_leave and worked_days >= total_workdays:
+    # 全勤獎金：無請假記錄才發放
+    if not has_leave:
         total_income += FULL_ATTENDANCE_BONUS
-        result.append(f"\n🏆 全勤獎金 +{FULL_ATTENDANCE_BONUS} 元")
 
-    result.append(f"\n💰 本月總收入：{int(total_income)} 元")
-    return result, int(total_income)
+    total_days = (end_date - start_date).days
+
+    msg_lines = []
+    msg_lines.append(f"📅 {year}年{month}月 薪資總結")
+    msg_lines.append(f"💰 總收入：{int(total_income)} 元")
+    if not has_leave:
+        msg_lines.append(f"🏆 全勤獎金 +{FULL_ATTENDANCE_BONUS} 元")
+    msg_lines.append(f"📊 出勤狀況：")
+    msg_lines.append(f"   • 實際出勤：{worked_days} 天")
+    msg_lines.append(f"   • 自動給薪：{auto_paid_days} 天")
+    msg_lines.append(f"   • 請假：{leave_days} 天")
+    msg_lines.append(f"   • 當月總天數：{total_days} 天")
+    if total_overtime_hours > 0:
+        msg_lines.append(f"⏱ 加班總時數：{total_overtime_hours:.1f} 小時")
+        msg_lines.append(f"💰 加班費總計：{int(total_overtime_pay)} 元")
+    if total_travel_fee > 0:
+        msg_lines.append(f"🚗 出差費總計：{int(total_travel_fee)} 元")
+
+    return "\n".join(msg_lines), int(total_income)
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -291,20 +297,18 @@ def callback():
 def handle_message(event):
     text = event.message.text
     user_id = event.source.user_id
+    user_name = get_line_user_name(user_id)
 
     if text == "本月":
         try:
-            report_lines, total = generate_monthly_report(user_id)
-            msg = "📅 本月薪資明細\n" + "\n".join(report_lines)
+            msg, total = generate_monthly_report(user_id, user_name)
             if len(msg) > 1900:
-                msg = f"📅 本月薪資總結\n💰 總收入：{total} 元\n（詳細明細過長，請至工作表查看）"
+                msg = f"📅 本月薪資總結\n💰 總收入：{total} 元\n（詳細資料請至工作表查看）"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         except Exception as e:
-            error_msg = f"產生報表時發生錯誤: {str(e)}"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"產生報表錯誤: {str(e)}"))
         return
 
-    # 打卡訊息處理
     try:
         data = parse_message(text)
         if data["status"] == "錯誤":
@@ -313,7 +317,7 @@ def handle_message(event):
             today = now_taipei()
             date_str = today.strftime("%Y-%m-%d")
             calc = calculate_work(data, today)
-            append_or_update_sheet(user_id, date_str, data, calc)
+            append_or_update_sheet(user_id, user_name, date_str, data, calc)
             reply = (f"📍 地點：{data.get('location', '')}\n"
                      f"工時：{calc['work_hours']} 小時\n"
                      f"加班：{calc['overtime']} 小時\n"
@@ -322,8 +326,7 @@ def handle_message(event):
                      f"今日收入：{calc['income']} 元")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
     except Exception as e:
-        error_reply = f"處理訊息時發生錯誤: {str(e)}"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_reply))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"處理錯誤: {str(e)}"))
 
 if __name__ == "__main__":
     app.run()
