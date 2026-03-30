@@ -298,27 +298,24 @@ def generate_yearly_report(user_id, user_name, year=None):
 
     monthly_data = []
     total_year = 0
-    other_months_income = 0
 
-    for month in range(1, 13):
+    # 只處理有數據的月份
+    for month in sorted(months_with_data):
         try:
             report_str, total = generate_monthly_report(user_id, user_name, year, month)
-            if month in months_with_data:
-                monthly_data.append((month, total))
-                total_year += total
-            else:
-                other_months_income += total
+            monthly_data.append((month, total))
+            total_year += total
         except Exception:
             pass
 
     msg_lines = []
     msg_lines.append(f"📅 {year}年 年度薪資總結")
-    for month, income in monthly_data:
-        msg_lines.append(f"   {month}月：{income} 元")
-    if other_months_income > 0:
-        msg_lines.append(f"   (其他月份總收入：{other_months_income} 元)")
-    total_year += other_months_income
-    msg_lines.append(f"💰 年度總收入：{total_year} 元")
+    if not monthly_data:
+        msg_lines.append("   該年度尚無任何打卡或請假記錄")
+    else:
+        for month, income in monthly_data:
+            msg_lines.append(f"   {month}月：{income} 元")
+        msg_lines.append(f"💰 年度總收入：{total_year} 元")
     return "\n".join(msg_lines), total_year
 
 def parse_command(text):
