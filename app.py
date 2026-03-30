@@ -152,7 +152,7 @@ def calculate_work(data, date):
 
     normal_pay = (normal_hours / 8.0) * daily_wage
 
-    overtime_pay = 0
+    overtime_pay = 0.0
     if overtime > 0:
         first2 = min(overtime, 2)
         overtime_pay += first2 * OVERTIME_HOURLY_RATE * 1.34
@@ -166,12 +166,16 @@ def calculate_work(data, date):
     travel_fee = TRAVEL_FEES.get(data.get("location", ""), 0)
     income = normal_pay + overtime_pay + travel_fee
 
+    # 轉為整數（四捨五入）
+    overtime_pay = int(round(overtime_pay))
+    income = int(round(income))
+
     return {
         "work_hours": round(work_hours, 1),
         "overtime": round(overtime, 1),
-        "overtime_pay": round(overtime_pay, 0),
+        "overtime_pay": overtime_pay,
         "travel_fee": travel_fee,
-        "income": round(income, 0)
+        "income": income
     }
 
 def append_or_update_sheet(user_id, user_name, date_str, data, calc):
@@ -200,9 +204,7 @@ def append_or_update_sheet(user_id, user_name, date_str, data, calc):
     else:
         worksheet.append_row(row_data)
 
-# ---------- 報表函數（支援指定年月）----------
 def generate_monthly_report(user_id, user_name, year=None, month=None):
-    """產生指定年月的薪資總結，預設為當月"""
     worksheet = get_user_worksheet(user_id, user_name)
     records = worksheet.get_all_records()
 
@@ -233,7 +235,7 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
 
         if date_str in record_map:
             row = record_map[date_str]
-            income = float(row["收入"])
+            income = int(row["收入"])
             status = row["狀態"]
             if status == "請假":
                 has_leave = True
@@ -242,10 +244,10 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
                 worked_days += 1
                 total_income += income
                 total_overtime_hours += float(row.get("加班", 0))
-                total_overtime_pay += float(row.get("加班費", 0))
-                total_travel_fee += float(row.get("出差費", 0))
+                total_overtime_pay += int(row.get("加班費", 0))
+                total_travel_fee += int(row.get("出差費", 0))
         else:
-            total_income += daily_wage
+            total_income += int(round(daily_wage))
 
         current += timedelta(days=1)
 
@@ -268,7 +270,6 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
     return "\n".join(msg_lines), int(total_income)
 
 def generate_yearly_report(user_id, user_name, year=None):
-    """產生指定年度的各月薪資累計（1~12月）"""
     if year is None:
         year = now_taipei().year
 
@@ -276,8 +277,6 @@ def generate_yearly_report(user_id, user_name, year=None):
     for month in range(1, 13):
         try:
             report_str, total = generate_monthly_report(user_id, user_name, year, month)
-            # 從 report_str 中提取總收入（可簡化：直接從返回的 total 取得）
-            # 但我們需要顯示月份與收入，可以使用 total 變數
             monthly_data.append((month, total))
         except Exception:
             monthly_data.append((month, 0))
@@ -291,9 +290,7 @@ def generate_yearly_report(user_id, user_name, year=None):
     msg_lines.append(f"💰 年度總收入：{total_year} 元")
     return "\n".join(msg_lines), total_year
 
-# ---------- 解析使用者指令 ----------
 def parse_command(text):
-    """解析使用者輸入，回傳 (command, params)"""
     text = text.strip()
     if text == "規則":
         return ("rule", None)
@@ -302,11 +299,10 @@ def parse_command(text):
     if text == "本月":
         return ("monthly", None)
 
-    # 嘗試解析月份格式：2026年2月、2026-02、2026/02
     patterns = [
-        r"(\d{4})年(\d{1,2})月",      # 2026年2月
-        r"(\d{4})-(\d{1,2})",         # 2026-02
-        r"(\d{4})/(\d{1,2})"          # 2026/02
+        r"(\d{4})年(\d{1,2})月",
+        r"(\d{4})-(\d{1,2})",
+        r"(\d{4})/(\d{1,2})"
     ]
     for pat in patterns:
         m = re.search(pat, text)
@@ -317,7 +313,6 @@ def parse_command(text):
                 return ("monthly", (year, month))
     return (None, None)
 
-# ===== Flask =====
 app = Flask(__name__)
 
 @app.route("/callback", methods=['POST'])
@@ -336,7 +331,6 @@ def handle_message(event):
     user_id = event.source.user_id
     user_name = get_line_user_name(user_id)
 
-    # 判斷指令類型
     cmd, params = parse_command(text)
     if cmd == "rule":
         rule_text = (
@@ -347,10 +341,12 @@ def handle_message(event):
             "3️⃣ 查詢本月：本月\n"
             "4️⃣ 查詢指定月份：2026年2月 或 2026-02\n"
             "5️⃣ 查詢年度：今年 / 本年\n"
-            "6️⃣ 此機器人會自動計算薪資（底薪43000+全勤2000）\n"
-            "   加班費187.5元/小時，星期六2倍\n"
-            "   未打卡日自動給付日薪\n"
-            "   每人獨立工作表，資料不混雜"
+            "6️⃣ 薪資計算：\n"
+            "   - 底薪43000元，全勤2000元（無請假即加發）\n"
+            "   - 加班費187.5元/小時，前2小時1.34倍，其後1.67倍，星期六2倍\n"
+            "   - 平日未打卡自動視為正常上下班（給付日薪）\n"
+            "   - 週末未打卡亦自動給薪\n"
+            "   - 每人獨立工作表，資料不混雜"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=rule_text))
         return
@@ -366,7 +362,6 @@ def handle_message(event):
         return
 
     if cmd == "monthly":
-        # 若 params 為 None，表示查詢本月；否則為 (year, month)
         try:
             if params is None:
                 msg, total = generate_monthly_report(user_id, user_name)
@@ -380,7 +375,7 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"產生報表錯誤: {str(e)}"))
         return
 
-    # 不是特殊指令，當作打卡訊息處理
+    # 打卡處理
     try:
         data = parse_message(text)
         if data["status"] == "錯誤":
