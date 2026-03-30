@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -9,7 +9,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ===== LINE Bot =====
+# ===== LINE =====
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
@@ -18,111 +18,112 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ===== Google Sheet =====
 SHEET_ID = os.environ.get("SHEET_ID")
-scope = ["https://spreadsheets.google.com/feeds",
-         "https://www.googleapis.com/auth/drive"]
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
 
 creds_json = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
-sheet = client.open_by_key(SHEET_ID).sheet1
 
 # ===== 薪資設定 =====
-BASE = 28000
-NEWBIE = 12000
-RENT = 3000
-FULL_ATTENDANCE = 2000
+BASE_SALARY = 28000
+NEWBIE_ALLOWANCE = 12000
+RENT_ALLOWANCE = 3000
+FULL_ATTENDANCE_BONUS = 2000
 
-TOTAL_SALARY = BASE + NEWBIE + RENT
-HOURLY = TOTAL_SALARY / 30 / 8
+TRAVEL_FEES = {
+    "台中": 200,
+    "台南": 400,
+    "高雄": 500
+}
 
-TRAVEL_FEES = {"台中":200, "高雄":500, "台南":400}
-
+# ===== Flask =====
 app = Flask(__name__)
 
-# ===== 訊息解析 =====
+# ===== 取得當月 Sheet =====
+def get_sheet():
+    now = datetime.now()
+    sheet_name = now.strftime("%Y-%m")
+
+    try:
+        return client.open_by_key(SHEET_ID).worksheet(sheet_name)
+    except:
+        sheet = client.open_by_key(SHEET_ID).add_worksheet(
+            title=sheet_name, rows="1000", cols="10"
+        )
+        sheet.append_row(["user_id","日期","狀態","地點","工時","加班","加班費","出差費","收入"])
+        return sheet
+
+# ===== 解析訊息 =====
 def parse_message(text):
     text = text.strip()
 
     if "請假" in text:
         return {"status": "請假"}
 
-    text = text.replace("～", "~").replace("-", "~")
+    try:
+        text = text.replace("～", "~").replace("-", "~")
+        match = re.search(r"(\D+)\s*(\d{3,4})~(\d{3,4})", text)
 
-    match = re.search(r"(\D+)\s*(\d{3,4})~(\d{3,4})", text)
-    if not match:
+        if not match:
+            return {"status": "錯誤"}
+
+        location = match.group(1).strip()
+        start = float(match.group(2)) / 100
+        end = float(match.group(3)) / 100
+
+        return {
+            "status": "上班",
+            "location": location,
+            "start": start,
+            "end": end
+        }
+    except:
         return {"status": "錯誤"}
 
-    return {
-        "status": "上班",
-        "location": match.group(1).strip(),
-        "start": float(match.group(2))/100,
-        "end": float(match.group(3))/100
-    }
-
-# ===== 計算 =====
+# ===== 計算薪資 =====
 def calculate_work(data):
-    """
-    統一邏輯：
-    - 全部用「時薪」計算
-    - 正常薪資 = 工時 × 時薪
-    - 加班 = 勞基法倍率
-    - 星期六 = 全部 ×2
-    """
-
-    # ===== 薪資結構 =====
     total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE + FULL_ATTENDANCE_BONUS
-
-    # 時薪（統一用30天）
     hourly_wage = total_salary / 30 / 8
 
-    # ===== 請假處理 =====
     if data["status"] == "請假":
         return {
             "work_hours": 0,
             "overtime": 0,
             "overtime_pay": 0,
             "travel_fee": 0,
-            "income": 0,
-            "note": "請假（扣全勤）"
+            "income": 0
         }
 
-    # ===== 工時 =====
     start = data["start"]
     end = data["end"]
 
-    work_hours = end - start - 1  # 扣休息1小時
-    work_hours = max(work_hours, 0)
-
-    # ===== 加班 =====
+    work_hours = max(end - start - 1, 0)
     overtime = max(work_hours - 8, 0)
 
-    # ===== 勞基法加班 =====
-    overtime_pay = 0
-
-    if overtime > 0:
-        # 前2小時 1.34倍
-        first_2 = min(overtime, 2)
-        overtime_pay += first_2 * hourly_wage * 1.34
-
-        # 第3小時以上 1.67倍
-        if overtime > 2:
-            overtime_pay += (overtime - 2) * hourly_wage * 1.67
-
-    # ===== 正常薪資 =====
+    # 正常薪資
     normal_hours = min(work_hours, 8)
     normal_pay = normal_hours * hourly_wage
 
-    # ===== 星期判斷 =====
-    weekday = datetime.now().weekday()  # 0=一, 5=六
+    # 加班
+    overtime_pay = 0
+    if overtime > 0:
+        first2 = min(overtime, 2)
+        overtime_pay += first2 * hourly_wage * 1.34
 
-    if weekday == 5:  # 星期六
+        if overtime > 2:
+            overtime_pay += (overtime - 2) * hourly_wage * 1.67
+
+    # 星期六 2倍
+    if datetime.now().weekday() == 5:
         normal_pay *= 2
         overtime_pay *= 2
 
-    # ===== 出差費 =====
     travel_fee = TRAVEL_FEES.get(data["location"], 0)
 
-    # ===== 總收入 =====
     income = normal_pay + overtime_pay + travel_fee
 
     return {
@@ -132,9 +133,13 @@ def calculate_work(data):
         "travel_fee": travel_fee,
         "income": round(income, 0)
     }
+
 # ===== 寫入 Sheet =====
-def append_to_sheet(date_str, data, calc):
+def append_to_sheet(user_id, date_str, data, calc):
+    sheet = get_sheet()
+
     sheet.append_row([
+        user_id,
         date_str,
         data.get("status",""),
         data.get("location",""),
@@ -142,44 +147,60 @@ def append_to_sheet(date_str, data, calc):
         calc.get("overtime",0),
         calc.get("overtime_pay",0),
         calc.get("travel_fee",0),
-        calc.get("income",0),
-        calc.get("leave",False)
+        calc.get("income",0)
     ])
 
-# ===== 月統計 =====
-def monthly_summary():
+# ===== 月報表 =====
+def generate_monthly_report(user_id):
+    sheet = get_sheet()
     records = sheet.get_all_records()
+
+    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE + FULL_ATTENDANCE_BONUS
+    daily_salary = total_salary / 30
+
+    # 只抓自己
+    records = [r for r in records if r["user_id"] == user_id]
+    record_map = {r["日期"]: r for r in records}
+
     now = datetime.now()
-    month = now.strftime("%Y-%m")
+    start = datetime(now.year, now.month, 1)
+    end = (start.replace(month=start.month % 12 + 1, day=1)
+           if start.month < 12 else datetime(start.year+1,1,1))
 
+    current = start
     total_income = 0
-    total_hours = 0
-    total_ot = 0
     has_leave = False
+    result = []
 
-    for r in records:
-        if r["日期"].startswith(month):
-            total_income += float(r["收入"])
-            total_hours += float(r["工時"])
-            total_ot += float(r["加班"])
-            if str(r.get("是否請假")).lower() == "true":
+    while current < end:
+        date_str = current.strftime("%Y-%m-%d")
+
+        if date_str in record_map:
+            row = record_map[date_str]
+            if row["狀態"] == "請假":
                 has_leave = True
+                income = daily_salary
+            else:
+                income = float(row["收入"])
+        else:
+            # 🔥 自動補休假
+            income = daily_salary
 
-    bonus = 0 if has_leave else FULL_ATTENDANCE
-    total_income += bonus
+        total_income += income
 
-    return f"""📅 本月統計
-總工時：{round(total_hours,1)} 小時
-總加班：{round(total_ot,1)} 小時
-全勤：{"❌ 無" if has_leave else "✅ 有"}
-全勤獎金：{bonus} 元
-💰 總收入：{round(total_income,0)} 元
-"""
+        result.append(f"{date_str}：{int(income)} 元")
+        current += timedelta(days=1)
+
+    # 全勤
+    if not has_leave:
+        total_income += FULL_ATTENDANCE_BONUS
+
+    return result, int(total_income)
 
 # ===== Webhook =====
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
 
     try:
@@ -189,30 +210,42 @@ def callback():
 
     return 'OK'
 
-# ===== LINE 處理 =====
+# ===== LINE =====
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text
+    user_id = event.source.user_id
 
-    # 👉 查本月
+    # 查本月
     if text == "本月":
-        reply = monthly_summary()
+        report, total = generate_monthly_report(user_id)
+
+        msg = "📅 本月薪資\n"
+        msg += "\n".join(report)
+        msg += f"\n\n💰 總收入：{total} 元"
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=msg)
+        )
+        return
+
+    data = parse_message(text)
+
+    if data["status"] == "錯誤":
+        reply = "格式錯誤：台南 800~2000 或 請假"
     else:
-        data = parse_message(text)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        calc = calculate_work(data)
 
-        if data["status"] == "錯誤":
-            reply = "格式錯誤：台中 800~2000 或 請假"
-        else:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            calc = calculate_work(data)
-            append_to_sheet(date_str, data, calc)
+        append_to_sheet(user_id, date_str, data, calc)
 
-            reply = (f"📍 {data.get('location','')}\n"
-                     f"工時：{calc['work_hours']} 小時\n"
-                     f"加班：{calc['overtime']} 小時\n"
-                     f"加班費：{calc['overtime_pay']} 元\n"
-                     f"出差費：{calc['travel_fee']} 元\n"
-                     f"今日收入：{calc['income']} 元")
+        reply = (f"📍 {data.get('location','')}\n"
+                 f"工時：{calc['work_hours']} 小時\n"
+                 f"加班：{calc['overtime']} 小時\n"
+                 f"加班費：{calc['overtime_pay']} 元\n"
+                 f"出差費：{calc['travel_fee']} 元\n"
+                 f"今日收入：{calc['income']} 元")
 
     line_bot_api.reply_message(
         event.reply_token,
@@ -221,4 +254,4 @@ def handle_message(event):
 
 # ===== 啟動 =====
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run()
