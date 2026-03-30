@@ -282,22 +282,42 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
 def generate_yearly_report(user_id, user_name, year=None):
     if year is None:
         year = now_taipei().year
-    current_month = now_taipei().month  # 取得目前月份，只顯示到當月
+    worksheet = get_user_worksheet(user_id, user_name)
+    records = worksheet.get_all_records()
+
+    # 找出該年度有記錄的月份（至少有一筆打卡或請假）
+    months_with_data = set()
+    for rec in records:
+        if rec.get("日期"):
+            try:
+                d = datetime.strptime(rec["日期"], "%Y-%m-%d")
+                if d.year == year:
+                    months_with_data.add(d.month)
+            except:
+                pass
 
     monthly_data = []
-    for month in range(1, current_month + 1):
+    total_year = 0
+    other_months_income = 0
+
+    for month in range(1, 13):
         try:
             report_str, total = generate_monthly_report(user_id, user_name, year, month)
-            monthly_data.append((month, total))
+            if month in months_with_data:
+                monthly_data.append((month, total))
+                total_year += total
+            else:
+                other_months_income += total
         except Exception:
-            monthly_data.append((month, 0))
-
-    total_year = sum(inc for _, inc in monthly_data)
+            pass
 
     msg_lines = []
-    msg_lines.append(f"📅 {year}年 年度薪資總結（1月～{current_month}月）")
+    msg_lines.append(f"📅 {year}年 年度薪資總結")
     for month, income in monthly_data:
         msg_lines.append(f"   {month}月：{income} 元")
+    if other_months_income > 0:
+        msg_lines.append(f"   (其他月份總收入：{other_months_income} 元)")
+    total_year += other_months_income
     msg_lines.append(f"💰 年度總收入：{total_year} 元")
     return "\n".join(msg_lines), total_year
 
