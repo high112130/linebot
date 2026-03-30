@@ -47,7 +47,6 @@ app = Flask(__name__)
 def get_sheet():
     now = datetime.now()
     sheet_name = now.strftime("%Y-%m")
-
     try:
         return client.open_by_key(SHEET_ID).worksheet(sheet_name)
     except:
@@ -60,14 +59,12 @@ def get_sheet():
 # ===== 解析訊息 =====
 def parse_message(text):
     text = text.strip()
-
     if "請假" in text:
         return {"status": "請假"}
 
     try:
         text = text.replace("～", "~").replace("-", "~")
         match = re.search(r"(\D+)\s*(\d{3,4})~(\d{3,4})", text)
-
         if not match:
             return {"status": "錯誤"}
 
@@ -75,78 +72,58 @@ def parse_message(text):
         start = float(match.group(2)) / 100
         end = float(match.group(3)) / 100
 
-        return {
-            "status": "上班",
-            "location": location,
-            "start": start,
-            "end": end
-        }
+        return {"status": "上班", "location": location, "start": start, "end": end}
     except:
         return {"status": "錯誤"}
 
 # ===== 計算薪資 =====
 def calculate_work(data):
-    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE + FULL_ATTENDANCE_BONUS
-    hourly_wage = total_salary / 30 / 8
+    # 月薪不含全勤獎金
+    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE
+    daily_base = total_salary / 22  # 假設22個工作日
+    hourly_wage = daily_base / 8
 
     if data["status"] == "請假":
-        return {
-            "work_hours": 0,
-            "overtime": 0,
-            "overtime_pay": 0,
-            "travel_fee": 0,
-            "income": 0
-        }
+        return {"work_hours": 0, "overtime": 0, "overtime_pay": 0,
+                "travel_fee": 0, "income": daily_base}
 
     start = data["start"]
     end = data["end"]
-
-    work_hours = max(end - start - 1, 0)
+    work_hours = max(end - start - 1, 0)  # 扣午休1小時
     overtime = max(work_hours - 8, 0)
-
-    # 正常薪資
     normal_hours = min(work_hours, 8)
+
     normal_pay = normal_hours * hourly_wage
 
-    # 加班
+    # 加班費依勞基法比例
     overtime_pay = 0
     if overtime > 0:
         first2 = min(overtime, 2)
         overtime_pay += first2 * hourly_wage * 1.34
-
         if overtime > 2:
             overtime_pay += (overtime - 2) * hourly_wage * 1.67
 
-    # 星期六 2倍
+    # 星期六 2倍日薪
     if datetime.now().weekday() == 5:
         normal_pay *= 2
         overtime_pay *= 2
 
     travel_fee = TRAVEL_FEES.get(data["location"], 0)
-
     income = normal_pay + overtime_pay + travel_fee
 
-    return {
-        "work_hours": round(work_hours, 1),
-        "overtime": round(overtime, 1),
-        "overtime_pay": round(overtime_pay, 0),
-        "travel_fee": travel_fee,
-        "income": round(income, 0)
-    }
+    return {"work_hours": round(work_hours, 1),
+            "overtime": round(overtime, 1),
+            "overtime_pay": round(overtime_pay, 0),
+            "travel_fee": travel_fee,
+            "income": round(income, 0)}
 
 # ===== 寫入 Sheet =====
 def append_to_sheet(user_id, date_str, data, calc):
     sheet = get_sheet()
-
     sheet.append_row([
-        user_id,
-        date_str,
-        data.get("status",""),
-        data.get("location",""),
-        calc.get("work_hours",0),
-        calc.get("overtime",0),
-        calc.get("overtime_pay",0),
-        calc.get("travel_fee",0),
+        user_id, date_str, data.get("status",""), data.get("location",""),
+        calc.get("work_hours",0), calc.get("overtime",0),
+        calc.get("overtime_pay",0), calc.get("travel_fee",0),
         calc.get("income",0)
     ])
 
@@ -154,9 +131,8 @@ def append_to_sheet(user_id, date_str, data, calc):
 def generate_monthly_report(user_id):
     sheet = get_sheet()
     records = sheet.get_all_records()
-
-    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE + FULL_ATTENDANCE_BONUS
-    daily_salary = total_salary / 30
+    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE
+    daily_base = total_salary / 22
 
     # 只抓自己
     records = [r for r in records if r["user_id"] == user_id]
@@ -169,30 +145,24 @@ def generate_monthly_report(user_id):
 
     current = start
     total_income = 0
-    has_leave = False
     result = []
+    worked_days = 0
 
     while current < end:
         date_str = current.strftime("%Y-%m-%d")
-
         if date_str in record_map:
             row = record_map[date_str]
-            if row["狀態"] == "請假":
-                has_leave = True
-                income = daily_salary
-            else:
-                income = float(row["收入"])
+            income = float(row["收入"])
+            if row["狀態"] != "請假":
+                worked_days += 1
         else:
-            # 🔥 自動補休假
-            income = daily_salary
-
+            income = daily_base  # 自動補假日
         total_income += income
-
         result.append(f"{date_str}：{int(income)} 元")
         current += timedelta(days=1)
 
-    # 全勤
-    if not has_leave:
+    # 全勤獎金只加一次
+    if worked_days == 22 and all(r["狀態"] != "請假" for r in records):
         total_income += FULL_ATTENDANCE_BONUS
 
     return result, int(total_income)
@@ -202,15 +172,13 @@ def generate_monthly_report(user_id):
 def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-
     return 'OK'
 
-# ===== LINE =====
+# ===== LINE 訊息 =====
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text
@@ -219,27 +187,18 @@ def handle_message(event):
     # 查本月
     if text == "本月":
         report, total = generate_monthly_report(user_id)
-
-        msg = "📅 本月薪資\n"
-        msg += "\n".join(report)
+        msg = "📅 本月薪資\n" + "\n".join(report)
         msg += f"\n\n💰 總收入：{total} 元"
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=msg)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
     data = parse_message(text)
-
     if data["status"] == "錯誤":
         reply = "格式錯誤：台南 800~2000 或 請假"
     else:
         date_str = datetime.now().strftime("%Y-%m-%d")
         calc = calculate_work(data)
-
         append_to_sheet(user_id, date_str, data, calc)
-
         reply = (f"📍 {data.get('location','')}\n"
                  f"工時：{calc['work_hours']} 小時\n"
                  f"加班：{calc['overtime']} 小時\n"
@@ -247,10 +206,7 @@ def handle_message(event):
                  f"出差費：{calc['travel_fee']} 元\n"
                  f"今日收入：{calc['income']} 元")
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply)
-    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 # ===== 啟動 =====
 if __name__ == "__main__":
