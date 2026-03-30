@@ -49,7 +49,6 @@ client = gspread.authorize(creds)
 _user_name_cache = {}
 
 def get_line_user_name(user_id):
-    """取得 LINE 用戶顯示名稱，並快取"""
     if user_id in _user_name_cache:
         return _user_name_cache[user_id]
     try:
@@ -61,7 +60,6 @@ def get_line_user_name(user_id):
         return user_id
 
 def get_user_worksheet(user_id, user_name=None):
-    """取得該用戶的 Google Sheet 工作表，若不存在則建立"""
     if user_name is None:
         user_name = get_line_user_name(user_id)
     sheet_title = f"{user_name} ({user_id})"[:100]
@@ -85,12 +83,10 @@ TRAVEL_FEES = {
     "高雄": 500
 }
 
-# ===== 輔助函數 =====
 def get_days_in_month(year, month):
     return calendar.monthrange(year, month)[1]
 
 def get_daily_wage(date):
-    """以底薪計算日薪 (底薪 ÷ 當月總天數)"""
     year = date.year
     month = date.month
     days = get_days_in_month(year, month)
@@ -110,7 +106,6 @@ def normalize_location(loc):
         return loc
     return loc
 
-# ===== 解析訊息 =====
 def parse_message(text):
     text = text.strip()
     if "請假" in text:
@@ -131,7 +126,6 @@ def parse_message(text):
     except:
         return {"status": "錯誤"}
 
-# ===== 計算當日收入 =====
 def calculate_work(data, date):
     if data["status"] == "請假":
         return {
@@ -180,7 +174,6 @@ def calculate_work(data, date):
         "income": round(income, 0)
     }
 
-# ===== 寫入/更新工作表 =====
 def append_or_update_sheet(user_id, user_name, date_str, data, calc):
     worksheet = get_user_worksheet(user_id, user_name)
     records = worksheet.get_all_records()
@@ -207,14 +200,16 @@ def append_or_update_sheet(user_id, user_name, date_str, data, calc):
     else:
         worksheet.append_row(row_data)
 
-# ===== 月報表（精簡版）=====
-def generate_monthly_report(user_id, user_name):
+# ---------- 報表函數（支援指定年月）----------
+def generate_monthly_report(user_id, user_name, year=None, month=None):
+    """產生指定年月的薪資總結，預設為當月"""
     worksheet = get_user_worksheet(user_id, user_name)
     records = worksheet.get_all_records()
 
     now = now_taipei()
-    year = now.year
-    month = now.month
+    if year is None or month is None:
+        year = now.year
+        month = now.month
     start_date = datetime(year, month, 1, tzinfo=TAIPEI_TZ)
     if month == 12:
         end_date = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
@@ -227,7 +222,6 @@ def generate_monthly_report(user_id, user_name):
     total_travel_fee = 0
     leave_days = 0
     worked_days = 0
-    auto_paid_days = 0
     has_leave = False
 
     record_map = {r["日期"]: r for r in records if r.get("日期")}
@@ -252,26 +246,19 @@ def generate_monthly_report(user_id, user_name):
                 total_travel_fee += float(row.get("出差費", 0))
         else:
             total_income += daily_wage
-            auto_paid_days += 1
 
         current += timedelta(days=1)
 
-    # 全勤獎金：無請假記錄才發放
     if not has_leave:
         total_income += FULL_ATTENDANCE_BONUS
-
-    total_days = (end_date - start_date).days
 
     msg_lines = []
     msg_lines.append(f"📅 {year}年{month}月 薪資總結")
     msg_lines.append(f"💰 總收入：{int(total_income)} 元")
-    if not has_leave:
-        msg_lines.append(f"🏆 全勤獎金 +{FULL_ATTENDANCE_BONUS} 元")
+    msg_lines.append(f"🏆 全勤獎金 {'✅' if not has_leave else '❌'}")
     msg_lines.append(f"📊 出勤狀況：")
     msg_lines.append(f"   • 實際出勤：{worked_days} 天")
-    msg_lines.append(f"   • 自動給薪：{auto_paid_days} 天")
     msg_lines.append(f"   • 請假：{leave_days} 天")
-    msg_lines.append(f"   • 當月總天數：{total_days} 天")
     if total_overtime_hours > 0:
         msg_lines.append(f"⏱ 加班總時數：{total_overtime_hours:.1f} 小時")
         msg_lines.append(f"💰 加班費總計：{int(total_overtime_pay)} 元")
@@ -279,6 +266,56 @@ def generate_monthly_report(user_id, user_name):
         msg_lines.append(f"🚗 出差費總計：{int(total_travel_fee)} 元")
 
     return "\n".join(msg_lines), int(total_income)
+
+def generate_yearly_report(user_id, user_name, year=None):
+    """產生指定年度的各月薪資累計（1~12月）"""
+    if year is None:
+        year = now_taipei().year
+
+    monthly_data = []
+    for month in range(1, 13):
+        try:
+            report_str, total = generate_monthly_report(user_id, user_name, year, month)
+            # 從 report_str 中提取總收入（可簡化：直接從返回的 total 取得）
+            # 但我們需要顯示月份與收入，可以使用 total 變數
+            monthly_data.append((month, total))
+        except Exception:
+            monthly_data.append((month, 0))
+
+    total_year = sum(inc for _, inc in monthly_data)
+
+    msg_lines = []
+    msg_lines.append(f"📅 {year}年 年度薪資總結")
+    for month, income in monthly_data:
+        msg_lines.append(f"   {month}月：{income} 元")
+    msg_lines.append(f"💰 年度總收入：{total_year} 元")
+    return "\n".join(msg_lines), total_year
+
+# ---------- 解析使用者指令 ----------
+def parse_command(text):
+    """解析使用者輸入，回傳 (command, params)"""
+    text = text.strip()
+    if text == "規則":
+        return ("rule", None)
+    if text in ["今年", "本年"]:
+        return ("yearly", None)
+    if text == "本月":
+        return ("monthly", None)
+
+    # 嘗試解析月份格式：2026年2月、2026-02、2026/02
+    patterns = [
+        r"(\d{4})年(\d{1,2})月",      # 2026年2月
+        r"(\d{4})-(\d{1,2})",         # 2026-02
+        r"(\d{4})/(\d{1,2})"          # 2026/02
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            year = int(m.group(1))
+            month = int(m.group(2))
+            if 1 <= month <= 12:
+                return ("monthly", (year, month))
+    return (None, None)
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -299,20 +336,55 @@ def handle_message(event):
     user_id = event.source.user_id
     user_name = get_line_user_name(user_id)
 
-    if text == "本月":
+    # 判斷指令類型
+    cmd, params = parse_command(text)
+    if cmd == "rule":
+        rule_text = (
+            "📌 使用規則\n"
+            "1️⃣ 上班打卡：地點 開始~結束\n"
+            "   例：台中 830~1730\n"
+            "2️⃣ 請假：請假\n"
+            "3️⃣ 查詢本月：本月\n"
+            "4️⃣ 查詢指定月份：2026年2月 或 2026-02\n"
+            "5️⃣ 查詢年度：今年 / 本年\n"
+            "6️⃣ 此機器人會自動計算薪資（底薪43000+全勤2000）\n"
+            "   加班費187.5元/小時，星期六2倍\n"
+            "   未打卡日自動給付日薪\n"
+            "   每人獨立工作表，資料不混雜"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=rule_text))
+        return
+
+    if cmd == "yearly":
         try:
-            msg, total = generate_monthly_report(user_id, user_name)
+            msg, total = generate_yearly_report(user_id, user_name)
             if len(msg) > 1900:
-                msg = f"📅 本月薪資總結\n💰 總收入：{total} 元\n（詳細資料請至工作表查看）"
+                msg = f"📅 年度薪資總結\n💰 總收入：{total} 元\n（詳細資料請至工作表查看）"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        except Exception as e:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"產生年度報表錯誤: {str(e)}"))
+        return
+
+    if cmd == "monthly":
+        # 若 params 為 None，表示查詢本月；否則為 (year, month)
+        try:
+            if params is None:
+                msg, total = generate_monthly_report(user_id, user_name)
+            else:
+                year, month = params
+                msg, total = generate_monthly_report(user_id, user_name, year, month)
+            if len(msg) > 1900:
+                msg = f"📅 {year if params else '本月'} 薪資總結\n💰 總收入：{total} 元\n（詳細資料請至工作表查看）"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         except Exception as e:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"產生報表錯誤: {str(e)}"))
         return
 
+    # 不是特殊指令，當作打卡訊息處理
     try:
         data = parse_message(text)
         if data["status"] == "錯誤":
-            reply = "格式錯誤：請輸入「地點 開始時間~結束時間」，例如「台中 830~1730」或「請假」"
+            reply = "格式錯誤：請輸入「地點 開始時間~結束時間」，例如「台中 830~1730」或「請假」\n輸入「規則」查看完整使用說明。"
         else:
             today = now_taipei()
             date_str = today.strftime("%Y-%m-%d")
@@ -326,7 +398,9 @@ def handle_message(event):
                      f"今日收入：{calc['income']} 元")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
     except Exception as e:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"處理錯誤: {str(e)}"))
+        error_reply = f"處理訊息時發生錯誤: {str(e)}"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_reply))
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
