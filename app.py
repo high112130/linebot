@@ -166,7 +166,6 @@ def calculate_work(data, date):
     travel_fee = TRAVEL_FEES.get(data.get("location", ""), 0)
     income = normal_pay + overtime_pay + travel_fee
 
-    # 轉為整數（四捨五入）
     overtime_pay = int(round(overtime_pay))
     income = int(round(income))
 
@@ -218,6 +217,7 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
     else:
         end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
 
+    total_overtime_hours = 0
     total_overtime_pay = 0
     total_travel_fee = 0
     leave_days = 0
@@ -238,9 +238,9 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
                 has_leave = True
                 leave_days += 1
             else:
-                # 有打卡且非請假，不論星期幾都算實際出勤？依使用者需求，僅平日才算實際出勤
                 if is_weekday:
                     worked_days += 1
+                total_overtime_hours += float(row.get("加班", 0))
                 total_overtime_pay += int(row.get("加班費", 0))
                 total_travel_fee += int(row.get("出差費", 0))
         else:
@@ -251,7 +251,6 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
         current += timedelta(days=1)
 
     # 計算底薪（扣請假日薪）
-    # 日薪 = BASE_SALARY / 當月總天數
     days_in_month = (end_date - start_date).days
     daily_wage = BASE_SALARY / days_in_month
     base_salary = BASE_SALARY - leave_days * daily_wage
@@ -264,17 +263,18 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
     total_income = base_salary + total_overtime_pay + total_travel_fee
     total_income = int(round(total_income))
 
+    # 建構新格式的訊息
     msg_lines = []
     msg_lines.append(f"📅 {year}年{month}月 薪資總結")
-    msg_lines.append(f"💰 底薪 + 全勤：{int(round(base_salary))} 元")
-    if total_overtime_pay > 0:
-        msg_lines.append(f"💰 加班費：{total_overtime_pay} 元")
-    if total_travel_fee > 0:
-        msg_lines.append(f"💰 出差費：{total_travel_fee} 元")
     msg_lines.append(f"💰 總收入：{total_income} 元")
     msg_lines.append(f"🏆 全勤獎金 {'✅' if not has_leave else '❌'}")
+    if total_overtime_hours > 0:
+        msg_lines.append(f"⏱ 加班總時數：{total_overtime_hours:.1f} 小時")
+        msg_lines.append(f"💰 加班費總計：{total_overtime_pay} 元")
+    if total_travel_fee > 0:
+        msg_lines.append(f"🚗 出差費總計：{total_travel_fee} 元")
     msg_lines.append(f"📊 出勤狀況：")
-    msg_lines.append(f"   • 實際出勤（平日）：{worked_days} 天")
+    msg_lines.append(f"   • 實際出勤：{worked_days} 天")
     msg_lines.append(f"   • 請假：{leave_days} 天")
 
     return "\n".join(msg_lines), total_income
@@ -282,9 +282,10 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
 def generate_yearly_report(user_id, user_name, year=None):
     if year is None:
         year = now_taipei().year
+    current_month = now_taipei().month  # 取得目前月份，只顯示到當月
 
     monthly_data = []
-    for month in range(1, 13):
+    for month in range(1, current_month + 1):
         try:
             report_str, total = generate_monthly_report(user_id, user_name, year, month)
             monthly_data.append((month, total))
@@ -294,7 +295,7 @@ def generate_yearly_report(user_id, user_name, year=None):
     total_year = sum(inc for _, inc in monthly_data)
 
     msg_lines = []
-    msg_lines.append(f"📅 {year}年 年度薪資總結")
+    msg_lines.append(f"📅 {year}年 年度薪資總結（1月～{current_month}月）")
     for month, income in monthly_data:
         msg_lines.append(f"   {month}月：{income} 元")
     msg_lines.append(f"💰 年度總收入：{total_year} 元")
