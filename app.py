@@ -61,57 +61,77 @@ def parse_message(text):
 
 # ===== 計算 =====
 def calculate_work(data):
-    today = datetime.now()
-    weekday = today.weekday()
+    """
+    統一邏輯：
+    - 全部用「時薪」計算
+    - 正常薪資 = 工時 × 時薪
+    - 加班 = 勞基法倍率
+    - 星期六 = 全部 ×2
+    """
 
+    # ===== 薪資結構 =====
+    total_salary = BASE_SALARY + NEWBIE_ALLOWANCE + RENT_ALLOWANCE + FULL_ATTENDANCE_BONUS
+
+    # 時薪（統一用30天）
+    hourly_wage = total_salary / 30 / 8
+
+    # ===== 請假處理 =====
     if data["status"] == "請假":
         return {
-            "work_hours":0,
-            "overtime":0,
-            "overtime_pay":0,
-            "travel_fee":0,
-            "income":0,
-            "leave":True
+            "work_hours": 0,
+            "overtime": 0,
+            "overtime_pay": 0,
+            "travel_fee": 0,
+            "income": 0,
+            "note": "請假（扣全勤）"
         }
 
+    # ===== 工時 =====
     start = data["start"]
     end = data["end"]
 
-    work_hours = max(end - start - 1, 0)
+    work_hours = end - start - 1  # 扣休息1小時
+    work_hours = max(work_hours, 0)
 
-    normal_hours = min(work_hours, 8)
+    # ===== 加班 =====
     overtime = max(work_hours - 8, 0)
 
-    # 正常薪資
-    normal_pay = normal_hours * HOURLY
-
-    # 加班費（勞基法）
+    # ===== 勞基法加班 =====
     overtime_pay = 0
+
     if overtime > 0:
-        first2 = min(overtime, 2)
-        overtime_pay += first2 * HOURLY * 1.34
+        # 前2小時 1.34倍
+        first_2 = min(overtime, 2)
+        overtime_pay += first_2 * hourly_wage * 1.34
 
+        # 第3小時以上 1.67倍
         if overtime > 2:
-            overtime_pay += (overtime - 2) * HOURLY * 1.67
+            overtime_pay += (overtime - 2) * hourly_wage * 1.67
 
-    # 星期六 2倍
-    if weekday == 5:
+    # ===== 正常薪資 =====
+    normal_hours = min(work_hours, 8)
+    normal_pay = normal_hours * hourly_wage
+
+    # ===== 星期判斷 =====
+    weekday = datetime.now().weekday()  # 0=一, 5=六
+
+    if weekday == 5:  # 星期六
         normal_pay *= 2
         overtime_pay *= 2
 
+    # ===== 出差費 =====
     travel_fee = TRAVEL_FEES.get(data["location"], 0)
 
+    # ===== 總收入 =====
     income = normal_pay + overtime_pay + travel_fee
 
     return {
-        "work_hours":round(work_hours,1),
-        "overtime":round(overtime,1),
-        "overtime_pay":round(overtime_pay,0),
-        "travel_fee":travel_fee,
-        "income":round(income,0),
-        "leave":False
+        "work_hours": round(work_hours, 1),
+        "overtime": round(overtime, 1),
+        "overtime_pay": round(overtime_pay, 0),
+        "travel_fee": travel_fee,
+        "income": round(income, 0)
     }
-
 # ===== 寫入 Sheet =====
 def append_to_sheet(date_str, data, calc):
     sheet.append_row([
