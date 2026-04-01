@@ -232,20 +232,29 @@ def generate_monthly_report(user_id, user_name, year=None, month=None, cutoff_da
             else:
                 end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
         else:
-            # 截止日為當天，結束日期設為隔天，以便迴圈包含當天
-            end_date = cutoff_date + timedelta(days=1)
+            # 截止日為當天，結束日期設為隔天，但不超過當月最後一天+1
+            next_day = cutoff_date + timedelta(days=1)
+            if month == 12:
+                month_end = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
+            else:
+                month_end = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
+            end_date = min(next_day, month_end)
 
     total_overtime_hours = 0
     total_overtime_pay = 0
     total_travel_fee = 0
     leave_days = 0
-    worked_days = 0          # 週一至週五且未請假的天數（含自動給薪）
+    worked_days = 0
     has_leave = False
 
     record_map = {r["日期"]: r for r in records if r.get("日期")}
 
     current = start_date
     while current < end_date:
+        # 安全防護：如果日期已經超出當月，立即停止（避免跨月）
+        if current.year != year or current.month != month:
+            break
+
         date_str = current.strftime("%Y-%m-%d")
         is_weekday = current.weekday() < 5  # 週一至週五
 
@@ -305,7 +314,6 @@ def generate_yearly_report(user_id, user_name, year=None):
     worksheet = get_user_worksheet(user_id, user_name)
     records = worksheet.get_all_records()
 
-    # 找出該年度有記錄的月份（至少有一筆打卡或請假）
     months_with_data = set()
     for rec in records:
         if rec.get("日期"):
@@ -319,7 +327,6 @@ def generate_yearly_report(user_id, user_name, year=None):
     monthly_data = []
     total_year = 0
 
-    # 只處理有數據的月份
     for month in sorted(months_with_data):
         try:
             report_str, total = generate_monthly_report(user_id, user_name, year, month)
