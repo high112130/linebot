@@ -203,7 +203,7 @@ def append_or_update_sheet(user_id, user_name, date_str, data, calc):
     else:
         worksheet.append_row(row_data)
 
-def generate_monthly_report(user_id, user_name, year=None, month=None):
+def generate_monthly_report(user_id, user_name, year=None, month=None, cutoff_date=None):
     worksheet = get_user_worksheet(user_id, user_name)
     records = worksheet.get_all_records()
 
@@ -212,10 +212,28 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
         year = now.year
         month = now.month
     start_date = datetime(year, month, 1, tzinfo=TAIPEI_TZ)
-    if month == 12:
-        end_date = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
+
+    # 確定該月的總天數（用於計算日薪）
+    total_days_in_month = calendar.monthrange(year, month)[1]
+    daily_wage = BASE_SALARY / total_days_in_month
+
+    # 設定迴圈的結束日期
+    if cutoff_date is None:
+        # 整月：結束日期為下個月1號
+        if month == 12:
+            end_date = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
+        else:
+            end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
     else:
-        end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
+        # 有截止日，且必須與當月相符，否則視為整月
+        if cutoff_date.year != year or cutoff_date.month != month:
+            if month == 12:
+                end_date = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
+            else:
+                end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
+        else:
+            # 截止日為當天，結束日期設為隔天，以便迴圈包含當天
+            end_date = cutoff_date + timedelta(days=1)
 
     total_overtime_hours = 0
     total_overtime_pay = 0
@@ -250,22 +268,24 @@ def generate_monthly_report(user_id, user_name, year=None, month=None):
 
         current += timedelta(days=1)
 
-    # 計算底薪（扣請假日薪）
-    days_in_month = (end_date - start_date).days
-    daily_wage = BASE_SALARY / days_in_month
-    base_salary = BASE_SALARY - leave_days * daily_wage
+    # 底薪 = 實際出勤天數 × 日薪
+    base_salary = worked_days * daily_wage
 
     # 全勤獎金（無請假才給）
     if not has_leave:
         base_salary += FULL_ATTENDANCE_BONUS
 
-    # 總收入 = 底薪（含全勤） + 加班費 + 出差費
+    # 總收入 = 底薪 + 加班費 + 出差費
     total_income = base_salary + total_overtime_pay + total_travel_fee
     total_income = int(round(total_income))
 
-    # 建構新格式的訊息
+    # 建構訊息
     msg_lines = []
-    msg_lines.append(f"📅 {year}年{month}月 薪資總結")
+    if cutoff_date is None or (cutoff_date.year == year and cutoff_date.month == month and cutoff_date.day == total_days_in_month):
+        msg_lines.append(f"📅 {year}年{month}月 薪資總結")
+    else:
+        msg_lines.append(f"📅 {year}年{month}月 薪資總結 (累積至{cutoff_date.month}月{cutoff_date.day}日)")
+
     msg_lines.append(f"💰 總收入：{total_income} 元")
     msg_lines.append(f"🏆 全勤獎金 {'✅' if not has_leave else '❌'}")
     if total_overtime_hours > 0:
@@ -392,7 +412,9 @@ def handle_message(event):
     if cmd == "monthly":
         try:
             if params is None:
-                msg, total = generate_monthly_report(user_id, user_name)
+                # 本月查詢：只累積到今天
+                cutoff = now_taipei()
+                msg, total = generate_monthly_report(user_id, user_name, cutoff_date=cutoff)
             else:
                 year, month = params
                 msg, total = generate_monthly_report(user_id, user_name, year, month)
