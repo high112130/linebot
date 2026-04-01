@@ -225,8 +225,9 @@ def generate_monthly_report(user_id, user_name, year=None, month=None, cutoff_da
         else:
             end_date = datetime(year, month+1, 1, tzinfo=TAIPEI_TZ)
     else:
-        # 有截止日，且必須與當月相符，否則視為整月
+        # 確保 cutoff_date 在當月範圍內，否則視為整月
         if cutoff_date.year != year or cutoff_date.month != month:
+            # 如果 cutoff_date 不在當月，則整月計算
             if month == 12:
                 end_date = datetime(year+1, 1, 1, tzinfo=TAIPEI_TZ)
             else:
@@ -247,11 +248,21 @@ def generate_monthly_report(user_id, user_name, year=None, month=None, cutoff_da
     worked_days = 0
     has_leave = False
 
-    record_map = {r["日期"]: r for r in records if r.get("日期")}
+    # 只保留目標年月內的記錄
+    record_map = {}
+    for r in records:
+        date_str = r.get("日期")
+        if date_str:
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d")
+                if d.year == year and d.month == month:
+                    record_map[date_str] = r
+            except:
+                pass
 
     current = start_date
     while current < end_date:
-        # 安全防護：如果日期已經超出當月，立即停止（避免跨月）
+        # 安全防護：如果日期已經超出當月，立即停止
         if current.year != year or current.month != month:
             break
 
@@ -419,7 +430,6 @@ def handle_message(event):
     if cmd == "monthly":
         try:
             if params is None:
-                # 本月查詢：只累積到今天
                 now = now_taipei()
                 cutoff = now
                 year, month = now.year, now.month
