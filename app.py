@@ -413,8 +413,10 @@ def handle_message(event):
         try:
             if params is None:
                 # 本月查詢：只累積到今天
-                cutoff = now_taipei()
-                msg, total = generate_monthly_report(user_id, user_name, cutoff_date=cutoff)
+                now = now_taipei()
+                cutoff = now
+                year, month = now.year, now.month
+                msg, total = generate_monthly_report(user_id, user_name, year, month, cutoff_date=cutoff)
             else:
                 year, month = params
                 msg, total = generate_monthly_report(user_id, user_name, year, month)
